@@ -15,6 +15,7 @@
 """Layers that act as activation functions."""
 # pylint: disable=g-classes-have-attributes
 
+from typing import Iterable
 from tensorflow.python.framework import dtypes
 from tensorflow.python.keras import backend
 from tensorflow.python.keras import constraints
@@ -136,7 +137,7 @@ class PReLU(Layer):
     self.alpha_constraint = constraints.get(alpha_constraint)
     if shared_axes is None:
       self.shared_axes = None
-    elif not isinstance(shared_axes, (list, tuple)):
+    elif not isinstance(shared_axes, Iterable):
       self.shared_axes = [shared_axes]
     else:
       self.shared_axes = list(shared_axes)
