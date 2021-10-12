@@ -44,7 +44,7 @@ struct ConvBackwardDataAutotuneGroup {
 };
 
 typedef AutotuneSingleton<ConvBackwardDataAutotuneGroup, ConvParameters,
-                          ConvAutotuneEntry>
+                          AutotuneEntry<se::dnn::ConvOp>>
     AutotuneConvBwdData;
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
@@ -353,7 +353,6 @@ void LaunchConv2DBackpropInputOp<GPUDevice, T>::operator()(
   }
   static int64_t ConvolveBackwardDataScratchSize =
       GetDnnWorkspaceLimit("TF_CUDNN_WORKSPACE_LIMIT_IN_MB", workspace_bytes);
-  DnnScratchAllocator scratch_allocator(ConvolveBackwardDataScratchSize, ctx);
   int device_id = stream->parent()->device_ordinal();
   DataType dtype = out_backprop.dtype();
   ConvParameters conv_parameters = {
@@ -385,30 +384,12 @@ void LaunchConv2DBackpropInputOp<GPUDevice, T>::operator()(
   OP_REQUIRES_OK(ctx, entry_or.status());
   auto autotune_entry = entry_or.ConsumeValueOrDie();
 
-  Status cudnn_launch_status;
-  if (!autotune_entry.is_algorithm_config()) {
-    auto& execution_plans = autotune_entry.GetExecutionPlans();
-    VLOG(4) << "Conv2DBackpropInput Execution Plan: "
-            << execution_plans.plan->getTag();
-    auto plan_and_scratch_or =
-        AllocateScratchOrFallback(&scratch_allocator, execution_plans);
-    OP_REQUIRES_OK(ctx, plan_and_scratch_or.status());
-    auto plan_and_scratch = plan_and_scratch_or.ConsumeValueOrDie();
-    cudnn_launch_status = stream->ConvolveWithExecutionPlan(
-        se::dnn::ConvolutionKind::BACKWARD_DATA, input_desc, in_backprop_ptr,
-        filter_desc, filter_ptr, output_desc, out_backprop_ptr, conv_desc,
-        std::get<se::DeviceMemoryBase>(plan_and_scratch),
-        *std::get<std::shared_ptr<const se::dnn::ConvolveExecutionPlan>>(
-            plan_and_scratch),
-        nullptr);
-  } else {
-    const auto& algorithm_config = autotune_entry.GetAlgorithmConfig();
-    cudnn_launch_status = stream->ConvolveWithAlgorithm(
-        se::dnn::ConvolutionKind::BACKWARD_DATA, input_desc, in_backprop_ptr,
-        filter_desc, filter_ptr, output_desc, out_backprop_ptr, conv_desc,
-        &scratch_allocator, algorithm_config, nullptr);
-  }
-
+  DnnScratchAllocator scratch_allocator(ConvolveBackwardDataScratchSize, ctx);
+  Status cudnn_launch_status =
+      LaunchAutotunedConv(autotune_entry, &scratch_allocator,
+                          se::dnn::ConvolutionKind::BACKWARD_DATA, stream,
+                          input_desc, in_backprop_ptr, filter_desc, filter_ptr,
+                          conv_desc, output_desc, out_backprop_ptr);
   if (!cudnn_launch_status.ok()) {
     ctx->SetStatus(cudnn_launch_status);
     return;

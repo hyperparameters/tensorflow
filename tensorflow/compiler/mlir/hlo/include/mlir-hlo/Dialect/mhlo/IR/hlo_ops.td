@@ -1739,10 +1739,8 @@ def HLO_ScatterOp: HLO_Op<"scatter", [RecursiveSideEffects]> {
   let hasFolder = 1;
 }
 
-// TODO(jpienaar): Add broadcastable trait.
 def HLO_SelectOp: HLO_Op<"select", [NoSideEffect, HLO_BroadcastingElementwise,
-    DeclareOpInterfaceMethods<InferShapedTypeOpInterface,
-    ["inferReturnTypeComponents", "reifyReturnTypeShapes"]>,
+    InferTensorTypeWithReify,
     DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Select operator";
   let description = [{
@@ -1762,6 +1760,12 @@ def HLO_SelectOp: HLO_Op<"select", [NoSideEffect, HLO_BroadcastingElementwise,
   let results = (outs HLO_Tensor);
 
   let hasFolder = 1;
+
+  let extraClassDeclaration = [{
+    static bool isCompatibleReturnTypes(TypeRange l, TypeRange r) {
+      return succeeded(mlir::verifyCompatibleShapes(l, r));
+    }
+  }];
 }
 
 def HLO_SelectAndScatterOp: HLO_Op<"select_and_scatter",
@@ -2364,7 +2368,8 @@ def HLO_CstrReshapableOp :
 
     ```
     %0 = mhlo.cstr_reshapable 12, [2, -1] -> success
-    %1 = mhlo.cstr_reshapable 13, [2, -1] -> failure ```
+    %1 = mhlo.cstr_reshapable 13, [2, -1] -> failure
+    ```
   }];
 
   let arguments = (ins Index:$num_elements, 1DTensorOf<[AnyInteger, Index]>:$dynamic_shape);

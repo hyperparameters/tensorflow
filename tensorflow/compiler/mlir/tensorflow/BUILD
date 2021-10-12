@@ -992,7 +992,7 @@ cc_library(
         "@llvm-project//mlir:Analysis",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Pass",
-        "@llvm-project//mlir:SideEffectInterfaces",
+        "@llvm-project//mlir:StandardOps",
         "@llvm-project//mlir:Support",
     ],
 )
@@ -1102,6 +1102,7 @@ cc_library(
         "transforms/cluster_tf_ops_pass.cc",
         "transforms/collection_ops_util.cc",
         "transforms/constant_op_device_assignment.cc",
+        "transforms/convert_control_to_data_outputs.cc",
         "transforms/convert_launch_func_to_tf_call.cc",
         "transforms/decompose_resource_ops_pass.cc",
         "transforms/device_attribute_to_launch.cc",

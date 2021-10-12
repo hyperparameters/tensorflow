@@ -272,12 +272,15 @@ StatusOr<se::dnn::AlgorithmConfig> BestCudnnConvAlgorithm(
   return result;
 }
 
-StatusOr<ConvAutotuneEntry> BestCudnnConvAlgorithm(
+template <typename Op>
+StatusOr<AutotuneEntry<Op>> BestCudnnConvAlgorithm(
     absl::Span<const AutotuneResult> results,
-    std::vector<std::unique_ptr<const se::dnn::ConvolveExecutionPlan>> plans) {
-  if (plans.size() != results.size()) {
+    std::vector<
+        std::unique_ptr<const se::dnn::OpRunner<typename Op::Signature>>>
+        runners) {
+  if (runners.size() != results.size()) {
     return errors::Internal(
-        "Mismatched size of autotune results and plans vectors.");
+        "Mismatched size of autotune results and runners vectors.");
   }
   int idx;
   int idx_no_scratch;
@@ -285,13 +288,27 @@ StatusOr<ConvAutotuneEntry> BestCudnnConvAlgorithm(
                       BestCudnnConvAlgorithmIndices(results));
   VLOG(2) << "fastest algorithm: "
           << proto_utils::FromDurationProto(results[idx].run_time())
-          << " with algo " << plans[idx]->getTag() << ", workspace bytes "
-          << plans[idx]->getWorkspaceSize();
-  return ConvAutotuneEntry(std::move(plans[idx]),
-                           idx_no_scratch == -1 || idx_no_scratch == idx
-                               ? nullptr
-                               : std::move(plans[idx_no_scratch]));
+          << " with algo " << runners[idx]->ToString() << ", workspace bytes "
+          << results[idx].scratch_bytes();
+  return AutotuneEntry<Op>::FromOpRunners(
+      std::move(runners[idx]), idx_no_scratch == -1 || idx_no_scratch == idx
+                                   ? nullptr
+                                   : std::move(runners[idx_no_scratch]));
 }
+
+template StatusOr<AutotuneEntry<se::dnn::ConvOp>>
+BestCudnnConvAlgorithm<se::dnn::ConvOp>(
+    absl::Span<const AutotuneResult> results,
+    std::vector<
+        std::unique_ptr<const se::dnn::OpRunner<se::dnn::ConvSignature>>>
+        runners);
+
+template StatusOr<AutotuneEntry<se::dnn::FusedConvOp>>
+BestCudnnConvAlgorithm<se::dnn::FusedConvOp>(
+    absl::Span<const AutotuneResult> results,
+    std::vector<
+        std::unique_ptr<const se::dnn::OpRunner<se::dnn::FusedConvSignature>>>
+        runners);
 
 }  // namespace tensorflow
 

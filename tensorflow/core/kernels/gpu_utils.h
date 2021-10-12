@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <unordered_map>
 
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/lib/core/status.h"
@@ -28,6 +29,8 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/stringprintf.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/stream_executor.h"
+#include "tensorflow/stream_executor/dnn.h"
+#include "tensorflow/stream_executor/lazy_op_runner.h"
 
 namespace stream_executor {
 class RedzoneAllocator;
@@ -258,29 +261,73 @@ void LogFusedConvForwardAutotuneResults(
     se::StreamExecutor* stream_exec, absl::Span<const AutotuneResult> results);
 
 // Autotuning map entry for cuDNN-frontend-capable APIs.
-class ConvAutotuneEntry {
+//
+// The longer-term intent is to remove the AlgorithmConfig variant and make this
+// contain only the two LazyOpRunners, but for the time being ROCm is stuck on
+// the legacy API and requires an AlgorithmConfig.
+template <typename Op>
+class AutotuneEntry {
  public:
-  ConvAutotuneEntry() : is_algorithm_config_(true) {}
+  AutotuneEntry() : is_algorithm_config_(true) {}
 
-  ConvAutotuneEntry(se::dnn::AlgorithmConfig config)
+  // Initialize with legacy-API AlgorithmConfig; used for the ROCm backend only.
+  explicit AutotuneEntry(se::dnn::AlgorithmConfig config)
       : is_algorithm_config_(true), algorithm_config_(std::move(config)) {}
 
-  ConvAutotuneEntry(
-      std::shared_ptr<const se::dnn::ConvolveExecutionPlan> plan,
-      std::shared_ptr<const se::dnn::ConvolveExecutionPlan> plan_no_scratch)
+  AutotuneEntry(std::shared_ptr<se::dnn::LazyOpRunner<Op>> primary,
+                std::shared_ptr<se::dnn::LazyOpRunner<Op>> no_scratch_fallback)
       : is_algorithm_config_(false),
-        execution_plans_{std::move(plan), std::move(plan_no_scratch)} {}
+        op_runners_{std::move(primary), std::move(no_scratch_fallback)} {}
 
-  struct ExecutionPlans {
-    std::shared_ptr<const se::dnn::ConvolveExecutionPlan> plan;  // Non-null
-    std::shared_ptr<const se::dnn::ConvolveExecutionPlan>
-        plan_no_scratch;  // Nullable
+  // Initialize from config data, without pre-cached runners, such as when
+  // loading AoT autotuning maps.
+  AutotuneEntry(se::dnn::AlgorithmDesc primary,
+                absl::optional<se::dnn::AlgorithmDesc> no_scratch_fallback)
+      : AutotuneEntry(std::make_shared<se::dnn::LazyOpRunner<Op>>(primary),
+                      no_scratch_fallback
+                          ? std::make_shared<se::dnn::LazyOpRunner<Op>>(
+                                *no_scratch_fallback)
+                          : nullptr) {}
 
-    bool operator==(const ExecutionPlans& other) const {
-      return plan->getTag() == other.plan->getTag() &&
-             ((!plan_no_scratch && !other.plan_no_scratch) ||
-              (plan_no_scratch && other.plan_no_scratch &&
-               plan_no_scratch->getTag() == other.plan_no_scratch->getTag()));
+  // Initialize with pre-cached OpRunners, such as during autotuning.
+  static StatusOr<AutotuneEntry> FromOpRunners(
+      std::unique_ptr<const se::dnn::OpRunner<typename Op::Signature>> primary,
+      std::unique_ptr<const se::dnn::OpRunner<typename Op::Signature>>
+          no_cache_fallback) {
+    TF_ASSIGN_OR_RETURN(
+        auto primary_cache,
+        se::dnn::LazyOpRunner<Op>::FromOpRunner(std::move(primary)));
+
+    if (no_cache_fallback) {
+      TF_ASSIGN_OR_RETURN(auto fallback_cache,
+                          se::dnn::LazyOpRunner<Op>::FromOpRunner(
+                              std::move(no_cache_fallback)));
+      return AutotuneEntry(std::move(primary_cache), std::move(fallback_cache));
+
+    } else {
+      return AutotuneEntry(std::move(primary_cache), nullptr);
+    }
+  }
+
+  struct OpRunners {
+    OpRunners() = default;
+
+    OpRunners(std::shared_ptr<se::dnn::LazyOpRunner<Op>> primary_,
+              std::shared_ptr<se::dnn::LazyOpRunner<Op>> no_scratch_fallback_)
+        : primary(std::move(primary_)),
+          no_scratch_fallback(std::move(no_scratch_fallback_)) {}
+
+    // Null iff this 'OpRunners' is default-constructed as part of the
+    // fake-variant in AutotuneEntry; users outside gpu_utils.h itself should
+    // never see primary = nullptr.
+    std::shared_ptr<se::dnn::LazyOpRunner<Op>> primary;
+    std::shared_ptr<se::dnn::LazyOpRunner<Op>> no_scratch_fallback;  // Nullable
+
+    bool operator==(const OpRunners& other) const {
+      return *primary == *other.primary &&
+             ((!no_scratch_fallback && !other.no_scratch_fallback) ||
+              (no_scratch_fallback && other.no_scratch_fallback &&
+               *no_scratch_fallback == *other.no_scratch_fallback));
     }
   };
 
@@ -291,25 +338,24 @@ class ConvAutotuneEntry {
     return algorithm_config_;
   }
 
-  const ExecutionPlans& GetExecutionPlans() const {
+  const OpRunners& GetOpRunners() const {
     DCHECK(!is_algorithm_config_);
-    return execution_plans_;
+    return op_runners_;
   }
 
   // AutotuneMap needs to test equality to keep track of the number of times an
-  // algorithm has won autotuning; for this purpose, we can consider execution
-  // plans with equal tags to be equal.
-  bool operator==(const ConvAutotuneEntry& other) const {
+  // algorithm has won autotuning; for this purpose, we can use ToString to
+  // determine whether runners are equal.
+  bool operator==(const AutotuneEntry<Op>& other) const {
     if (is_algorithm_config_) {
       return other.is_algorithm_config_ &&
              algorithm_config_ == other.algorithm_config_;
     }
 
-    return !other.is_algorithm_config_ &&
-           execution_plans_ == other.execution_plans_;
+    return !other.is_algorithm_config_ && op_runners_ == other.op_runners_;
   }
 
-  bool operator!=(const ConvAutotuneEntry& other) const {
+  bool operator!=(const AutotuneEntry<Op>& other) const {
     return !(*this == other);
   }
 
@@ -317,8 +363,8 @@ class ConvAutotuneEntry {
     if (is_algorithm_config_) {
       return algorithm_config_.ToString();
     }
-    return absl::StrCat("{", execution_plans_.plan->getTag(), ", ",
-                        execution_plans_.plan_no_scratch->getTag(), "}");
+    return absl::StrCat("{", op_runners_.primary->ToString(), ", ",
+                        op_runners_.no_scratch_fallback->ToString(), "}");
   }
 
  private:
@@ -326,8 +372,13 @@ class ConvAutotuneEntry {
   // bool and both fields.
   bool is_algorithm_config_;
   se::dnn::AlgorithmConfig algorithm_config_;
-  ExecutionPlans execution_plans_;
+  OpRunners op_runners_;
 };
+
+namespace internal {
+StatusOr<std::tuple<int, int>> BestCudnnConvAlgorithmIndices(
+    absl::Span<const AutotuneResult> results);
+}  // namespace internal
 
 // Returns the best algorithms for the config, one is the fastest, the other is
 // other is fastest with 0 scratch space. Unsuccessful autotuning results are
@@ -335,9 +386,16 @@ class ConvAutotuneEntry {
 StatusOr<se::dnn::AlgorithmConfig> BestCudnnConvAlgorithm(
     absl::Span<const AutotuneResult> results);
 
-StatusOr<ConvAutotuneEntry> BestCudnnConvAlgorithm(
+// Explicitly-instantiated with ConvOp and FusedConvOp.
+//
+// The definition can't be in the header because including .pb.h files in
+// headers is forbidden.
+template <typename Op>
+StatusOr<AutotuneEntry<Op>> BestCudnnConvAlgorithm(
     absl::Span<const AutotuneResult> results,
-    std::vector<std::unique_ptr<const se::dnn::ConvolveExecutionPlan>> plans);
+    std::vector<
+        std::unique_ptr<const se::dnn::OpRunner<typename Op::Signature>>>
+        runners);
 
 }  // namespace tensorflow
 

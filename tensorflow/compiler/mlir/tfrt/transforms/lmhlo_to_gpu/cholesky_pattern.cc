@@ -17,6 +17,7 @@
 #include <string>
 
 #include "mlir-hlo/Dialect/mhlo/IR/lhlo_gpu_ops.h"
+#include "tensorflow/compiler/mlir/tfrt/transforms/lmhlo_to_gpu/pattern_utils.h"
 #include "tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
 #include "tfrt/gpu/kernels/gpu_ops.h"  // from @tf_runtime
 #include "tfrt/gpu/passes/passes.h"  // from @tf_runtime
@@ -26,18 +27,6 @@
 namespace tensorflow {
 namespace {
 
-static cudaDataType_t MlirTypeToCudaDataType(mlir::Type type) {
-  if (type.isF16()) return CUDA_R_16F;
-  if (type.isF32()) return CUDA_R_32F;
-  if (type.isF64()) return CUDA_R_64F;
-  if (auto complex_type = type.dyn_cast<mlir::ComplexType>()) {
-    auto element_type = complex_type.getElementType();
-    if (element_type.isF32()) return CUDA_C_32F;
-    if (element_type.isF64()) return CUDA_C_64F;
-  }
-  llvm_unreachable("unsupported type");
-}
-
 struct CholeskyRewritePattern
     : tfrt::gpu::GpuAsyncOpConversionPattern<lmhlo_gpu::CholeskyOp> {
   using tfrt::gpu::GpuAsyncOpConversionPattern<
@@ -45,19 +34,11 @@ struct CholeskyRewritePattern
   FailureOr<Value> matchAndRewriteOp(
       lmhlo_gpu::CholeskyOp op, OpAdaptor adaptor, Value chain, Value stream,
       ConversionPatternRewriter& rewriter) const override {
-    if (!llvm::all_of(adaptor.getOperands(), [](Value operand) {
-          return operand.getType().isa<tfrt::gpu::BufferType>();
-        }))
-      return rewriter.notifyMatchFailure(op, "expected buffer operands");
-
-    chain = rewriter
-                .create<tfrt::gpu::MemCopyOp>(op.getLoc(), adaptor.output(),
-                                              adaptor.input(), stream, chain)
-                .getResult();
+    chain = rewriter.create<tfrt::gpu::MemCopyOp>(
+        op.getLoc(), adaptor.output(), adaptor.input(), stream, chain);
 
     auto handle =
-        rewriter.create<tfrt::gpu::SolverCreateOp>(op.getLoc(), stream)
-            .getResult();
+        rewriter.create<tfrt::gpu::SolverCreateOp>(op.getLoc(), stream);
 
     cublasFillMode_t fill_mode =
         op.is_lower() ? CUBLAS_FILL_MODE_LOWER : CUBLAS_FILL_MODE_UPPER;
@@ -78,11 +59,9 @@ struct CholeskyRewritePattern
     auto batch =
         rewriter.create<tfrt::compiler::ConstantI32Op>(op.getLoc(), batch_size);
 
-    chain = rewriter
-                .create<tfrt::gpu::SolverPotrfBatchOp>(
-                    op.getLoc(), handle, fill_mode, n, data_type,
-                    adaptor.output(), n, adaptor.info(), batch, chain)
-                .getResult();
+    chain = rewriter.create<tfrt::gpu::SolverPotrfBatchOp>(
+        op.getLoc(), handle, fill_mode, n, data_type, adaptor.output(), n,
+        adaptor.info(), batch, chain);
     rewriter.eraseOp(op);
     return chain;
   }

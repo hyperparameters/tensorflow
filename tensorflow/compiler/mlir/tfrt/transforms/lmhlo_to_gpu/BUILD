@@ -22,6 +22,19 @@ gentbl_cc_library(
 )
 
 cc_library(
+    name = "pattern_utils",
+    srcs = ["pattern_utils.cc"],
+    hdrs = ["pattern_utils.h"],
+    tags = ["gpu"],
+    deps = [
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:StandardOps",
+        "@tf_runtime//:basic_kernels_opdefs",
+        "@tf_runtime//backends/gpu:gpu_wrapper",
+    ],
+)
+
+cc_library(
     name = "lmhlo_to_gpu",
     srcs = [
         "ccl_pattern.cc",
@@ -29,6 +42,7 @@ cc_library(
         "custom_call_pattern.cc",
         "gemm_pattern.cc",
         "lmhlo_to_gpu.cc",
+        "triangular_solve_pattern.cc",
     ],
     hdrs = [
         "lmhlo_to_gpu.h",
@@ -45,9 +59,11 @@ cc_library(
     ],
     deps = [
         ":GpuPassesIncGen",
+        ":pattern_utils",
         "//tensorflow/compiler/mlir/hlo:lhlo",
         "//tensorflow/compiler/mlir/hlo:lhlo_gpu",
         "//tensorflow/compiler/mlir/tensorflow",
+        "//tensorflow/compiler/mlir/xla:attribute_exporter",
         "//tensorflow/compiler/mlir/xla:type_to_shape",
         "//tensorflow/compiler/xla:shape_util",
         "//tensorflow/compiler/xla:xla_data_proto_cc",
@@ -73,7 +89,7 @@ cc_library(
     alwayslink = 1,
 )
 
-# The lmhlo-to-gpu-binary pass is a separate target to avoid a dependcy cycle:
+# The lmhlo-to-gpu-binary pass is a separate target to avoid a dependency cycle:
 # :lmhlo_to_gpu_binary > xla/service/gpu:gpu_executable > :lmhlo_to_gpu
 cc_library(
     name = "lmhlo_to_gpu_binary",
@@ -101,8 +117,7 @@ cc_library(
         "//tensorflow/compiler/xla/service/gpu:gpu_executable",
         "//tensorflow/compiler/xla/service/gpu:ir_emitter",
         "//tensorflow/compiler/xla/service/gpu:launch_dimensions",
-        "//tensorflow/compiler/xla/service/gpu:nvptx_compiler",
-        "//tensorflow/compiler/xla/service/gpu:nvptx_compiler_impl",
+        "//tensorflow/compiler/xla/service/gpu:nvptx_helper",
         "//tensorflow/compiler/xla/service/gpu:thunk",
         "//tensorflow/compiler/xla/service/gpu/llvm_gpu_backend",
         "@llvm-project//llvm:Support",

@@ -1231,6 +1231,10 @@ llvm::Optional<Value> convertSqueezeOp(PatternRewriter& rewriter, Operation* op,
       }
     }
   } else {
+    for (auto& dim : squeeze_dims) {
+      dim = dim < 0 ? dim + input_shape.size() : dim;
+    }
+
     // Remove only specified dims.
     // First sort the array so they can be picked off in sequence.
     std::sort(squeeze_dims.begin(), squeeze_dims.end(),
@@ -2727,6 +2731,16 @@ llvm::Optional<Value> convertResizeOp(PatternRewriter& rewriter, Operation* op,
 
   auto input_shape = input_type.getShape();
   auto output_shape = output_type.getShape();
+
+  if (input_type.isDynamicDim(1) || input_type.isDynamicDim(2)) {
+    op->emitOpError("ConvertResizeOp: resize dynamic input not supported.");
+    return llvm::None;
+  }
+
+  if (output_type.isDynamicDim(1) || output_type.isDynamicDim(2)) {
+    op->emitOpError("ConvertResizeOp: resize dynamic output not supported.");
+    return llvm::None;
+  }
 
   size_t input_height = input_shape[1];
   size_t input_width = input_shape[2];
