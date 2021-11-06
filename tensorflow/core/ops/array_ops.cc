@@ -168,7 +168,7 @@ Status TransposeShapeFn(InferenceContext* c) {
 
     for (int32_t i = 0; i < rank; ++i) {
       int64_t in_idx = data[i];
-      if (in_idx >= rank) {
+      if (in_idx >= rank || in_idx <= -rank) {
         return errors::InvalidArgument("perm dim ", in_idx,
                                        " is out of range of input rank ", rank);
       }
@@ -1291,7 +1291,7 @@ REGISTER_OP("Identity")
     .Input("input: T")
     .Output("output: T")
     .Attr("T: type")
-    .SetForwardTypeFn(full_type::ReplicateInputs())
+    .SetForwardTypeFn(full_type::ReplicateInput())
     .SetShapeFn(shape_inference::UnchangedShape);
 
 REGISTER_OP("Snapshot")

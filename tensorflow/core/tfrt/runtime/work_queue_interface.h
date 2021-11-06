@@ -41,25 +41,23 @@ class WorkQueueInterface : public tfrt::ConcurrentWorkQueue {
     *intra_op_threadpool = nullptr;
     return tensorflow::Status::OK();
   }
-
- private:
-  // TODO(chky): The method below is not very useful right now because we have
-  // to initialize tensorflow specific concepts (eg. intra op threadpool) which
-  // cannot be known in TFRT core infra including ConcurrentWorkQueue. Consider
-  // removing this method from base, and consider whether we can introduce
-  // more interfaces in TFRT to support these tensorflow specific concepts.
-  llvm::Error InitRequest(tfrt::RequestContextBuilder*) final {
-    return llvm::Error::success();
-  }
 };
 
 inline WorkQueueInterface::~WorkQueueInterface() = default;
 
-// Create a WorkQueueInterface from a ConcurrentWorkQueue. The returned
+// Creates a WorkQueueInterface from a ConcurrentWorkQueue. The returned
 // WorkQueueInterface simply delegates all its public methods to the specified
 // ConcurrentWorkQueue.
 std::unique_ptr<WorkQueueInterface> WrapDefaultWorkQueue(
     std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue);
+
+// Creates a WorkQueueInterface from a ConcurrentWorkQueue. The returned
+// WorkQueueInterface simply delegates all its public methods to the specified
+// ConcurrentWorkQueue. The `intra_thread_pool` is stored and will be passed out
+// when `InitializeRequest()` is called.
+std::unique_ptr<WorkQueueInterface> WrapDefaultWorkQueue(
+    std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue,
+    thread::ThreadPoolInterface* intra_thread_pool);
 
 // A helper function that wraps tasks with traceme events.
 template <typename Callable>

@@ -51,7 +51,7 @@ limitations under the License.
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/refcount.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
-#include "tensorflow/core/protobuf/coordination_service.pb.h"
+#include "tensorflow/core/protobuf/coordination_config.pb.h"
 #include "tensorflow/core/protobuf/error_codes.pb.h"
 
 namespace tensorflow {
@@ -243,7 +243,7 @@ Status EagerServiceImpl::CreateContext(const CreateContextRequest* request,
   }
   TF_RETURN_IF_ERROR(env_->session_mgr->CreateSession(
       session_name, request->server_def(), request->cluster_device_attributes(),
-      true));
+      request->server_def().default_session_config().isolate_session_state()));
   int64_t context_id = request->context_id();
   std::function<void()> session_destroyer = [this, context_id, session_name]() {
     env_->rendezvous_mgr->Cleanup(context_id);
@@ -311,12 +311,12 @@ Status EagerServiceImpl::CreateContext(const CreateContextRequest* request,
 #if !defined(IS_MOBILE_PLATFORM)
   const auto& config = request->server_def().default_session_config();
   const bool enable_coordination =
-      !config.experimental().coordination_service().service_type().empty();
+      !config.experimental().coordination_config().service_type().empty();
   if (enable_coordination) {
     auto dist_mgr = std::make_unique<EagerContextDistributedManager>(ctx);
     ctx->SetDistributedManager(std::move(dist_mgr));
     TF_RETURN_IF_ERROR(ctx->GetDistributedManager()->EnableCoordinationService(
-        config.experimental().coordination_service().service_type(), env_,
+        config.experimental().coordination_config().service_type(), env_,
         request->server_def(), worker_session->worker_cache()));
     std::unique_ptr<CoordinationClientCache> client_cache;
     TF_RETURN_IF_ERROR(
@@ -775,7 +775,7 @@ tensorflow::Status EagerServiceImpl::GetServerContext(
   auto iter = contexts_.find(context_id);
   if (iter == contexts_.end()) {
     *server_context = nullptr;
-    return errors::Unavailable(strings::Printf(
+    return errors::Aborted(strings::Printf(
         "Unable to find a context_id matching the specified one "
         "(%llu). Perhaps the worker was restarted, or the context was GC'd?",
         static_cast<unsigned long long>(context_id)));

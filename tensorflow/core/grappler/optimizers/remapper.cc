@@ -24,6 +24,7 @@ limitations under the License.
 #include "tensorflow/core/grappler/optimizers/constant_folding.h"
 #include "tensorflow/core/grappler/utils.h"
 #include "tensorflow/core/grappler/utils/graph_view.h"
+#include "tensorflow/core/grappler/utils/pattern_utils.h"
 #include "tensorflow/core/grappler/utils/symbolic_shapes.h"
 #include "tensorflow/core/grappler/utils/topological_sort.h"
 #include "tensorflow/core/lib/core/errors.h"
@@ -142,23 +143,28 @@ struct TensorToHashBucket {
 // Contraction node followed by a BiasAdd.
 struct ContractionWithBiasAdd {
   ContractionWithBiasAdd() = default;
-  ContractionWithBiasAdd(int contraction, int bias_add)
-      : contraction(contraction), bias_add(bias_add) {}
+  ContractionWithBiasAdd(int contraction, int bias_add, int bias_port)
+      : contraction(contraction), bias_add(bias_add), bias_port(bias_port) {}
 
   int contraction = kMissingIndex;
   int bias_add = kMissingIndex;
+  int bias_port = 1;
 };
 
 // Contraction node followed by a BiasAdd and Activation.
 struct ContractionWithBiasAddAndActivation {
   ContractionWithBiasAddAndActivation() = default;
   ContractionWithBiasAddAndActivation(int contraction, int bias_add,
-                                      int activation)
-      : contraction(contraction), bias_add(bias_add), activation(activation) {}
+                                      int activation, int bias_port)
+      : contraction(contraction),
+        bias_add(bias_add),
+        activation(activation),
+        bias_port(bias_port) {}
 
   int contraction = kMissingIndex;
   int bias_add = kMissingIndex;
   int activation = kMissingIndex;
+  int bias_port = 1;
 };
 
 // Contraction node followed by a Squeeze and BiasAdd.
@@ -206,16 +212,18 @@ struct ContractionWithBatchNormAndActivation {
 struct ContractionWithBiasAddAndAdd {
   ContractionWithBiasAddAndAdd() = default;
   ContractionWithBiasAddAndAdd(int contraction, int bias_add, int add,
-                               int port_id)
+                               int port_id, int bias_port)
       : contraction(contraction),
         bias_add(bias_add),
         add(add),
-        port_id(port_id) {}
+        port_id(port_id),
+        bias_port(bias_port) {}
 
   int contraction = kMissingIndex;
   int bias_add = kMissingIndex;
   int add = kMissingIndex;
   int port_id = 0;
+  int bias_port = 1;
 };
 
 // Contraction node followed by a BiasAdd, Add and Relu.
@@ -223,18 +231,21 @@ struct ContractionWithBiasAddAndAdd {
 struct ContractionWithBiasAndAddActivation {
   ContractionWithBiasAndAddActivation() = default;
   ContractionWithBiasAndAddActivation(int contraction, int bias_add, int add,
-                                      int port_id, int activation)
+                                      int port_id, int activation,
+                                      int bias_port)
       : contraction(contraction),
         bias_add(bias_add),
         add(add),
         port_id(port_id),
-        activation(activation) {}
+        activation(activation),
+        bias_port(bias_port) {}
 
   int contraction = kMissingIndex;
   int bias_add = kMissingIndex;
   int add = kMissingIndex;
   int port_id = 0;
   int activation = kMissingIndex;
+  int bias_port = 1;
 };
 
 bool IsInPreserveSet(const RemapperContext& ctx, const NodeDef* node) {
@@ -435,6 +446,77 @@ inline bool HasAtMostOneDataFanoutAtPort0(
   return absl::c_count_if(node_view.GetRegularFanout(0), predicate) <= 1;
 }
 
+bool IsConvOrMatMul(const NodeDef& node) {
+  return IsConv2D(node) || IsDepthwiseConv2dNative(node) || IsMatMul(node);
+}
+
+// Returns true if one input to Add is Conv2D or DepthwiseConv2dNative or
+// MatMul, and the other input is semantically equivalent to BiasAdd.
+bool IsBiasSemanticAdd(const RemapperContext& ctx,
+                       const utils::MutableNodeView& node_view,
+                       int& bias_port) {
+  if (!IsMKLEnabled()) return false;
+
+  const auto* node_def = node_view.node();
+  if (!IsAdd(*node_def) || node_view.NumRegularFanins() != 2) return false;
+
+  const auto& props = ctx.graph_properties.GetInputProperties(node_def->name());
+  if (props.size() < 2) return false;
+
+  const auto& regular_fanin_0 = node_view.GetRegularFanin(0);
+  const auto* node_view_0 = regular_fanin_0.node_view();
+  const auto* node_def_0 = node_view_0->node();
+  const auto& regular_fanin_1 = node_view.GetRegularFanin(1);
+  const auto* node_view_1 = regular_fanin_1.node_view();
+  const auto* node_def_1 = node_view_1->node();
+
+  auto is_channel_last_format = [](const NodeDef& node) -> bool {
+    if (node.attr().contains("data_format")) {
+      const string data_format = node.attr().at("data_format").s();
+      return (data_format == "NHWC");
+    }
+    return true;
+  };
+
+  if (!IsConvOrMatMul(*node_def_0) && !IsConvOrMatMul(*node_def_1))
+    return false;
+
+  if (!is_channel_last_format(*node_def_0) ||
+      !is_channel_last_format(*node_def_1))
+    return false;
+
+  const TensorShapeProto& prot0_shape = props[0].shape();
+  const TensorShapeProto& prot1_shape = props[1].shape();
+  if (prot0_shape.unknown_rank() || prot1_shape.unknown_rank() ||
+      prot0_shape.dim_size() < 1 || prot1_shape.dim_size() < 1 ||
+      !IsKnown(prot0_shape.dim(prot0_shape.dim_size() - 1)) ||
+      !IsKnown(prot1_shape.dim(prot1_shape.dim_size() - 1)))
+    return false;
+
+  // Helper function to check Add/AddV2 could be replaced with BiasAdd.
+  const auto is_supported_shape =
+      [](const TensorShapeProto& shape,
+         const TensorShapeProto& bcast_shape) -> bool {
+    if (shape.dim_size() < 2 || bcast_shape.dim_size() != 1) return false;
+    int channel_dim = shape.dim(shape.dim_size() - 1).size();
+    return (channel_dim == bcast_shape.dim(0).size());
+  };
+
+  if (ShapesSymbolicallyEqual(prot0_shape, prot1_shape) ||
+      !ShapesBroadcastable(prot0_shape, prot1_shape))
+    return false;
+
+  if (is_supported_shape(prot0_shape, prot1_shape)) {
+    bias_port = 1;
+    return true;
+  }
+  if (is_supported_shape(prot1_shape, prot0_shape)) {
+    bias_port = 0;
+    return true;
+  }
+  return false;
+}
+
 bool FindContractionWithBias(const RemapperContext& ctx, int node_index,
                              ContractionWithBiasAdd* matched,
                              bool check_device_compatible = true) {
@@ -444,11 +526,13 @@ bool FindContractionWithBias(const RemapperContext& ctx, int node_index,
   if (HasControlFaninOrFanout(*node_view)) return false;
 
   const auto* node_def = node_view->node();
-  if (!IsBiasAdd(*node_def)) return false;
+  int bias_port = 1;
+  if (!IsBiasAdd(*node_def) && !IsBiasSemanticAdd(ctx, *node_view, bias_port))
+    return false;
 
   // Input to the BiasAdd must be a Conv2D/3D or a MatMul.
   if (node_view->NumRegularFanins() < 1) return false;
-  const auto& regular_fanin_0 = node_view->GetRegularFanin(0);
+  const auto& regular_fanin_0 = node_view->GetRegularFanin(1 - bias_port);
   const auto* contraction_node_view = regular_fanin_0.node_view();
   const auto* contraction_node_def = contraction_node_view->node();
 
@@ -466,7 +550,7 @@ bool FindContractionWithBias(const RemapperContext& ctx, int node_index,
 
   // Check that data type and data format are supported on assigned device.
   const ContractionWithBiasAdd pattern{contraction_node_view->node_index(),
-                                       node_index};
+                                       node_index, bias_port};
   if (check_device_compatible && !IsDeviceCompatible(ctx, pattern))
     return false;
 
@@ -503,7 +587,7 @@ bool FindContractionWithBiasAndActivation(
 
   // Get the contraction node
   const auto* contraction_node_view =
-      bias_add_node_view->GetRegularFanin(0).node_view();
+      bias_add_node_view->GetRegularFanin(1 - base.bias_port).node_view();
   const auto* contraction_node_def = contraction_node_view->node();
 
   // Currently, only matmul + bias + (tanh or Sigmoid) is enabled
@@ -518,8 +602,8 @@ bool FindContractionWithBiasAndActivation(
     return false;
 
   // Check that data type and data format are supported on assigned device.
-  const ContractionWithBiasAddAndActivation pattern{base.contraction,
-                                                    base.bias_add, node_index};
+  const ContractionWithBiasAddAndActivation pattern{
+      base.contraction, base.bias_add, node_index, base.bias_port};
   if (!IsDeviceCompatible(ctx, pattern)) return false;
 
   // We successfully found a {Conv2D, MatMul}+BiasAdd+Activation pattern.
@@ -744,6 +828,7 @@ bool FindContractionWithBiasAddAndAdd(const RemapperContext& ctx,
   matched->contraction = base.contraction;
   matched->bias_add = base.bias_add;
   matched->add = node_view.node_index();
+  matched->bias_port = base.bias_port;
 
   return true;
 }
@@ -806,10 +891,202 @@ bool FindContractionWithBiasAndAddActivation(
   // We successfully found a Conv2D+BiasAdd+AddN+activation pattern
   // or Conv3D+BiasAdd+AddN+activation pattern
   const ContractionWithBiasAndAddActivation pattern{
-      base.contraction, base.bias_add, base.add, base.port_id, node_index};
+      base.contraction, base.bias_add, base.add,
+      base.port_id,     node_index,    base.bias_port};
   *matched = pattern;
 
   return true;
+}
+
+inline bool VerifyConstants(RemapperContext* ctx,
+                            std::map<string, int>* nodes_map,
+                            std::map<string, float>* values_map) {
+  using utils::MutableNodeView;
+  for (auto it = values_map->begin(); it != values_map->end(); ++it) {
+    int node_idx = nodes_map->at(it->first);
+    MutableNodeView* node_view = ctx->graph_view.GetNode(node_idx);
+    NodeDef* node_def = node_view->node();
+    Tensor const_tensor;
+    if (node_def != nullptr && node_def->op() == "Const" &&
+        const_tensor.FromProto(node_def->attr().at("value").tensor())) {
+      if (const_tensor.NumElements() == 1) {
+        DataType dtype = const_tensor.dtype();
+        if (!(dtype == DT_FLOAT || dtype == DT_BFLOAT16)) return false;
+        auto const_value = (dtype == DT_FLOAT)
+                               ? const_tensor.flat<float>()(0)
+                               : const_tensor.flat<bfloat16>()(0);
+        if (std::abs(const_value - it->second) > 1e-2) return false;
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Gelu in python api generates a number of nodes in the graph. Depending on the
+// parmeter `approximate={True/False}` different types of ops are generated. We
+// distinguish them as `GeluExact` that uses Erf and `GeluApproximate` that
+// uses Tanh.
+bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
+                              std::map<string, int>* matched_nodes_map,
+                              std::set<int>* remove_node_indices,
+                              bool* is_gelu_approximate) {
+  // Gelu fusion is enabled only with oneDNN library.
+  if (!IsMKLEnabled()) return false;
+
+  using utils::MatchingDirection;
+  using utils::NodeStatus;
+  // clang-format off
+  utils::OpTypePattern gelu_exact_pattern =
+    {"Mul", "output", NodeStatus::kReplace,
+      {
+        {"Mul", "erf_plus_one_times_one_half", NodeStatus::kRemove,
+          {
+            {"AddV2", "erf_plus_one", NodeStatus::kRemove,
+              {
+                {"Erf", "erf", NodeStatus::kRemove,
+                  {
+                    {"Mul", "bias_add_times_square_root_one_half", NodeStatus::kRemove,
+                      {
+                        {"BiasAdd", "bias_add", NodeStatus::kRemove},
+                        {"Const", "square_root_one_half", NodeStatus::kRemain}
+                      }
+                    }
+                  }
+                },
+                {"Const", "one", NodeStatus::kRemain}
+              }
+            },
+            {"Const", "one_half", NodeStatus::kRemain}
+          }
+        },
+        {"BiasAdd", "bias_add", NodeStatus::kRemove,
+          {
+            {"MatMul", "matmul", NodeStatus::kRemove},
+            {"*", "bias", NodeStatus::kRemain}
+          }
+        }
+      }
+    };
+
+  // Gelu approximate uses Pow(x, 3) which is optimized by arithmetic optimizer
+  // as Mul(x, Square(x)) with an arifact of control dependency. So we try to
+  // match pattern at second pass of remapper which reccieves _FusedMatMul
+  // (MatMul + BiasAdd) with control dependency removed.
+  utils::OpTypePattern gelu_approximate_pattern =
+    {"Mul", "output", NodeStatus::kReplace,
+      {
+        {"Mul", "tanh_plus_one_times_one_half", NodeStatus::kRemove,
+          {
+            {"AddV2", "tanh_plus_one", NodeStatus::kRemove,
+              {
+                {"Tanh", "tanh", NodeStatus::kRemove,
+                  {
+                    {"Mul", "matmul_plus_mul_times_square_root_two_over_pi", NodeStatus::kRemove,
+                      {
+                        {"AddV2", "matmul_plus_mul", NodeStatus::kRemove,
+                          {
+                            {"_FusedMatMul", "matmul", NodeStatus::kRemove},
+                            {"Mul", "mul", NodeStatus::kRemove,
+                              {
+                                {"Mul", "empirical_const_times_matmul", NodeStatus::kRemove,
+                                  {
+                                    {"Const", "empirical_const", NodeStatus::kRemain},
+                                    {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+                                  }
+                                },
+                                {"Square", "square", NodeStatus::kRemove,
+                                  {
+                                    {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {"Const", "square_root_two_over_pi", NodeStatus::kRemain}
+                      }
+                    }
+                  }
+                },
+                {"Const", "one", NodeStatus::kRemain}
+              }
+            },
+            {"Const", "one_half", NodeStatus::kRemain}
+          }
+        },
+        {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+      }
+    };
+  // clang-format on
+  bool found_gelu_exact = false;
+  bool found_gelu_approximate = false;
+  utils::SubGraphMatcher<MatchingDirection::kFollowInputs> graph_matcher(
+      &(ctx->graph_view));
+  // Find GeluExact
+  matched_nodes_map->clear();
+  remove_node_indices->clear();
+  found_gelu_exact =
+      graph_matcher.GetMatchedNodes(gelu_exact_pattern, ctx->nodes_to_preserve,
+                                    ctx->graph_view.GetNode(node_index),
+                                    matched_nodes_map, remove_node_indices);
+  // Find GeluApproximate
+  if (!found_gelu_exact) {
+    matched_nodes_map->clear();
+    remove_node_indices->clear();
+    found_gelu_approximate = graph_matcher.GetMatchedNodes(
+        gelu_approximate_pattern, ctx->nodes_to_preserve,
+        ctx->graph_view.GetNode(node_index), matched_nodes_map,
+        remove_node_indices);
+  }
+
+  // Pattern matcher does subgraph matching based on op types only. The matcher
+  // also does a sanity check on nodes tagged as `kRemove`, i.e., they do not
+  // have any consumer outside the matched nodes. In order to replace the
+  // subgraph, we need additional checks, for example, if the key ops have been
+  // placed on CPU, desired data type, const has desired value etc. For the
+  // following fusion: MatMul + BiasAdd + Gelu (disintegrated into smaller
+  // ops), we check if (i) MatMul op is CpuCompatible, (ii) const nodes have
+  // desired values.
+  if (found_gelu_exact) {
+    // Check if the MatMul to be fused is CPU compatible
+    NodeDef* matmul_node =
+        ctx->graph_view.GetNode(matched_nodes_map->at("matmul"))->node();
+    if (!IsCpuCompatibleMatMul(*ctx, matmul_node)) {
+      matched_nodes_map->clear();
+      remove_node_indices->clear();
+      return false;
+    }
+    // Check if the matched constants have desired values.
+    if (found_gelu_exact) {
+      std::map<string, float> values_map = {
+          {"square_root_one_half", 0.707106}, {"one", 1.0}, {"one_half", 0.5}};
+      if (!VerifyConstants(ctx, matched_nodes_map, &values_map)) return false;
+    }
+  } else if (found_gelu_approximate) {
+    // Check if _FusedMatMul contains only BiasAdd
+    NodeDef* matmul_node =
+        ctx->graph_view.GetNode(matched_nodes_map->at("matmul"))->node();
+    auto fused_ops = matmul_node->attr().at("fused_ops").list().s();
+    if (fused_ops.size() == 1) {
+      if (fused_ops.at(0) != "BiasAdd") return false;
+    } else {
+      return false;
+    }
+    // Check if the matched constants have desired values.
+    std::map<string, float> values_map = {{"square_root_two_over_pi", 0.797884},
+                                          {"one", 1.0},
+                                          {"one_half", 0.5},
+                                          {"empirical_const", 0.044715}};
+    if (!VerifyConstants(ctx, matched_nodes_map, &values_map)) return false;
+  } else {
+    return false;
+  }
+  *is_gelu_approximate = found_gelu_approximate ? true : false;
+  return (found_gelu_exact || found_gelu_approximate);
 }
 
 bool FindFusedBatchNorm(const RemapperContext& ctx, int node_index,
@@ -1346,10 +1623,9 @@ Status AddFusedContractionNode(RemapperContext* ctx,
   NodeDef fused_op;
   fused_op.set_name(bias_add.name());
   fused_op.set_device(contraction.device());
-  fused_op.add_input(contraction.input(0));  // 0: input
-  fused_op.add_input(contraction.input(1));  // 1: filter
-  fused_op.add_input(bias_add.input(1));     // 2: bias
-
+  fused_op.add_input(contraction.input(0));               // 0: input
+  fused_op.add_input(contraction.input(1));               // 1: filter
+  fused_op.add_input(bias_add.input(matched.bias_port));  // 2: bias
   if (IsConv2D(contraction)) {
     fused_op.set_op(kFusedConv2D);
     CopyConv2DAttributes(contraction, &fused_op);
@@ -1365,7 +1641,6 @@ Status AddFusedContractionNode(RemapperContext* ctx,
   }
 
   SetFusedOpAttributes(&fused_op, {"BiasAdd"});
-
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   Status status;
   mutation->AddNode(std::move(fused_op), &status);
@@ -1397,9 +1672,9 @@ Status AddFusedContractionNode(
   NodeDef fused_op;
   fused_op.set_name(activation.name());
   fused_op.set_device(contraction.device());
-  fused_op.add_input(contraction.input(0));  // 0: input
-  fused_op.add_input(contraction.input(1));  // 1: filter
-  fused_op.add_input(bias_add.input(1));     // 2: bias
+  fused_op.add_input(contraction.input(0));               // 0: input
+  fused_op.add_input(contraction.input(1));               // 1: filter
+  fused_op.add_input(bias_add.input(matched.bias_port));  // 2: bias
 
   if (IsConv2D(contraction)) {
     fused_op.set_op(kFusedConv2D);
@@ -1586,7 +1861,7 @@ Status AddFusedContractionNode(RemapperContext* ctx,
       contraction.input(0));  // 0: input(conv) / a (matmul)
   contraction_node.add_input(
       contraction.input(1));  // 1: filter(conv) / b (matmul)
-  contraction_node.add_input(bias_add.input(1));  // 2: bias
+  contraction_node.add_input(bias_add.input(matched.bias_port));  // 2: bias
 
   // Add OP has two inputs, one is conv+bias/matmul+bias pattern matched
   // previously, the other input to add is fused here.
@@ -1631,7 +1906,7 @@ Status AddFusedContractionNode(
   fused_conv2d.add_input(contraction.input(0));  // 0: input
   fused_conv2d.add_input(contraction.input(1));  // 1: filter
   const NodeDef& bias_add = graph->node(matched.bias_add);
-  fused_conv2d.add_input(bias_add.input(1));  // 2: bias
+  fused_conv2d.add_input(bias_add.input(matched.bias_port));  // 2: bias
 
   // Add OP has two inputs, one is conv+bias pattern matched previously,
   // the other input to add is fused here.
@@ -1652,6 +1927,50 @@ Status AddFusedContractionNode(
   (*nodes_to_delete)[matched.bias_add] = true;
   (*nodes_to_delete)[matched.contraction] = true;
 
+  return Status::OK();
+}
+
+Status AddFusedMatMulBiasAddAndGelu(RemapperContext* ctx,
+                                    std::map<string, int>* matched_nodes_map,
+                                    std::set<int>* remove_node_indices,
+                                    std::vector<bool>* invalidated_nodes,
+                                    std::vector<bool>* nodes_to_delete,
+                                    bool is_gelu_approximate) {
+  auto* output_node =
+      ctx->graph_view.GetNode(matched_nodes_map->at("output"))->node();
+  auto* matmul_node =
+      ctx->graph_view.GetNode(matched_nodes_map->at("matmul"))->node();
+
+  NodeDef fused_node;
+  // Fused node should have the name of terminal node of the fusion.
+  fused_node.set_name(output_node->name());
+  fused_node.set_op("_FusedMatMul");
+  fused_node.set_device(matmul_node->device());
+  fused_node.add_input(matmul_node->input(0));
+  fused_node.add_input(matmul_node->input(1));
+  if (is_gelu_approximate) {
+    fused_node.add_input(matmul_node->input(2));
+  } else {
+    auto* bias_add_node =
+        ctx->graph_view.GetNode(matched_nodes_map->at("bias_add"))->node();
+    fused_node.add_input(bias_add_node->input(1));
+  }
+  CopyMatMulAttributes(*matmul_node, &fused_node);
+  if (is_gelu_approximate)
+    SetFusedOpAttributes(&fused_node, {"BiasAdd", "GeluApproximate"});
+  else
+    SetFusedOpAttributes(&fused_node, {"BiasAdd", "GeluExact"});
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddNode(std::move(fused_node), &status);
+  TF_RETURN_IF_ERROR(status);
+  TF_RETURN_IF_ERROR(mutation->Apply());
+  (*invalidated_nodes)[matched_nodes_map->at("output")] = true;
+
+  for (const auto& node_idx : *remove_node_indices) {
+    (*nodes_to_delete)[node_idx] = true;
+  }
   return Status::OK();
 }
 
@@ -2030,24 +2349,19 @@ Status AddTensorToHashBucketNode(RemapperContext* ctx,
   return Status::OK();
 }
 
-bool IsConv2DOrMatMul(const NodeDef& node) {
-  return IsConv2D(node) || IsMatMul(node);
-}
-
 bool IsContractionWithAdd(const RemapperContext& ctx, int node_index) {
   const auto* node_view = ctx.graph_view.GetNode(node_index);
 
-  // Candidate for Conv2D + Add or Conv2D + BiasAdd + Add fusion.
-  //               MatMul + Add or MatMul + BiasAdd + Add fusion.
+  // Candidate for Contraction + Add or Contraction + BiasAdd + Add fusion.
+  // Contraction candidate: MatMul, Conv2D, DepthwiseConv2dNative
   auto is_supported_add_input = [](const auto* node_view) -> bool {
-    // Currently only support Conv2D and MatMul
-    if (IsConv2DOrMatMul(*node_view->node())) return true;
-    if (IsBiasAdd(*node_view->node())) {
+    if (IsConvOrMatMul(*node_view->node())) return true;
+    if (IsBiasAdd(*node_view->node()) || IsAdd(*node_view->node())) {
       if (node_view->NumRegularFanins() < 2) return false;
       const auto& bias_add_fanin_0 = node_view->GetRegularFanin(0);
       const auto& bias_add_fanin_1 = node_view->GetRegularFanin(1);
-      return IsConv2DOrMatMul(*bias_add_fanin_0.node_view()->node()) ||
-             IsConv2DOrMatMul(*bias_add_fanin_1.node_view()->node());
+      return IsConvOrMatMul(*bias_add_fanin_0.node_view()->node()) ||
+             IsConvOrMatMul(*bias_add_fanin_1.node_view()->node());
     }
     return false;
   };
@@ -2105,7 +2419,8 @@ bool RequiresInferredShapes(const RemapperContext& ctx, int node_index) {
     const auto* relu_fanin_0_node_view = relu_fanin_0.node_view();
     const auto* relu_fanin_0_node_def = relu_fanin_0_node_view->node();
 
-    if (!IsBiasAdd(*relu_fanin_0_node_def)) return false;
+    if (!IsBiasAdd(*relu_fanin_0_node_def) && !IsAdd(*relu_fanin_0_node_def))
+      return false;
     if (GetDataTypeFromAttr(*relu_fanin_0_node_def, "T") != DT_FLOAT)
       return false;
 
@@ -2113,11 +2428,9 @@ bool RequiresInferredShapes(const RemapperContext& ctx, int node_index) {
 
     const auto& biasadd_fanin_0 = relu_fanin_0_node_view->GetRegularFanin(0);
     const auto* biasadd_fanin_0_node_def = biasadd_fanin_0.node_view()->node();
-
     if (!IsConv2D(*biasadd_fanin_0_node_def)) return false;
     if (GetDataTypeFromAttr(*biasadd_fanin_0_node_def, "T") != DT_FLOAT)
       return false;
-
     return true;
   };
 
@@ -2176,7 +2489,6 @@ bool RequiresInferredShapes(const RemapperContext& ctx, int node_index) {
          is_batch_norm_fusion_candidate() ||
          is_batch_norm_grad_fusion_candidate();
 }
-
 }  // namespace
 
 Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
@@ -2239,6 +2551,19 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
         TF_RETURN_IF_ERROR(
             AddFusedContractionNode(&ctx, contract_with_bias_and_add,
                                     &invalidated_nodes, &nodes_to_delete));
+        continue;
+      }
+
+      // Remap MatMul + BiasAdd + gelu-subgraph
+      std::map<string, int> matched_nodes_map;
+      std::set<int> remove_node_indices;
+      bool is_gelu_approximate = false;
+      if (FindMatMulBiasAddAndGelu(&ctx, i, &matched_nodes_map,
+                                   &remove_node_indices,
+                                   &is_gelu_approximate)) {
+        TF_RETURN_IF_ERROR(AddFusedMatMulBiasAddAndGelu(
+            &ctx, &matched_nodes_map, &remove_node_indices, &invalidated_nodes,
+            &nodes_to_delete, is_gelu_approximate));
         continue;
       }
     }

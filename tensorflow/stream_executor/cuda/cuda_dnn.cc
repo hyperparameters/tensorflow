@@ -19,6 +19,7 @@ limitations under the License.
 #include <memory>
 #include <utility>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -3882,16 +3883,33 @@ static port::StatusOr<cudnn_frontend::ExecutionPlan> RebuildExecutionPlan(
         "Got legacy cuDNN algorithm enum in RebuildExecutionPlan.");
   }
 
-  auto engine = cudnn_frontend::EngineBuilder()
-                    .setOperationGraph(op_graph)
-                    .setGlobalEngineIdx(desc.algo_id())
-                    .build();
+  // Errors encountered when building a cuDNN operation graph are surfaced in an
+  // unprecedented and innovative way: they're written into a field of the
+  // contained engine object, but then clobbered by the object's move
+  // constructor which makes more cuDNN API calls and encounters further errors.
+  // The only way to get the actual errors is to peek at them via the returned
+  // rvalue reference before actually moving the object to finish its
+  // initialization.
+  cudnn_frontend::EngineBuilder engine_builder;
+  engine_builder.setOperationGraph(op_graph).setGlobalEngineIdx(desc.algo_id());
+  auto&& unmoved = engine_builder.build();
+  RETURN_MSG_IF_CUDNN_ERROR(unmoved);
+  cudnn_frontend::Engine engine = std::move(unmoved);
   RETURN_MSG_IF_CUDNN_ERROR(engine);
 
+  // Miscellaneous compiler bugs and linker issues conspired to make it
+  // impossible for AlgorithmDesc to just give us a map initially.  Get the
+  // vector of tuning knobs and build the map locally.
+  auto tuning_knobs_vec = desc.TuningKnobs();
+  absl::flat_hash_map<int64_t, int64_t> tuning_knobs;
+  tuning_knobs.reserve(tuning_knobs_vec.size());
+  for (const auto& pair : tuning_knobs_vec) {
+    tuning_knobs[pair.first] = pair.second;
+  }
+
   for (auto& knob : engine.getSupportedKnobs()) {
-    const auto it =
-        desc.TuningKnobs().find(static_cast<int64_t>(knob.getKnobType()));
-    if (it != desc.TuningKnobs().end()) {
+    const auto it = tuning_knobs.find(static_cast<int64_t>(knob.getKnobType()));
+    if (it != tuning_knobs.end()) {
       knob.setChoice(it->second);
     }
   }
@@ -4347,7 +4365,11 @@ port::StatusOr<dnn::AlgorithmDesc> ExecutionPlanToAlgorithmDesc(
     }
   }
 
-  return dnn::AlgorithmDesc(engine_id, tuning_knobs);
+  std::vector<std::pair<int64_t, int64_t>> tuning_knobs_vec;
+  tuning_knobs_vec.reserve(tuning_knobs.size());
+  absl::c_copy(tuning_knobs, std::back_inserter(tuning_knobs_vec));
+
+  return dnn::AlgorithmDesc(engine_id, tuning_knobs_vec);
 }
 
 // An OpRunner implemented by an ExecutionPlan.
@@ -4514,34 +4536,22 @@ port::Status CudnnSupport::GetConvolveRunners(
     }
 
     for (const auto& algo : algorithms) {
-      SE_ASSIGN_OR_RETURN(
-          auto runner,
-          ConvolveRunnerFromDesc(algo, kind, input_type, output_type,
-                                 input_descriptor, filter_descriptor,
-                                 output_descriptor, convolution_descriptor));
-
-      CudnnConvolutionDescriptor conv(
-          convolution_descriptor,
-          ToCudnnDataType(GetConvAccumulatorType(input_type)));
-      SE_ASSIGN_OR_RETURN(bool use_tensor_ops,
-                          UseTensorOps(stream, input_type, algo));
-      conv.set_use_tensor_op_math(use_tensor_ops);
-
-      out_exec_plans->push_back(std::make_unique<CudnnLegacyConvRunner>(
-          parent_, cudnn_.get(), algo, input_type, output_type, kind,
-          /* input_nd = */
-          CudnnTensorDescriptor(
-              input_descriptor,
-              ToCudnnDataType(input_type, input_descriptor.layout())),
-          /* output_nd = */
-          CudnnTensorDescriptor(
-              output_descriptor,
-              ToCudnnDataType(input_type, output_descriptor.layout())),
-          /* filter = */
-          CudnnFilterDescriptor(
-              filter_descriptor,
-              ToCudnnDataType(input_type, filter_descriptor.layout())),
-          std::move(conv)));
+      auto runner_or = ConvolveRunnerFromDesc(
+          algo, kind, input_type, output_type, input_descriptor,
+          filter_descriptor, output_descriptor, convolution_descriptor);
+      if (!runner_or.ok()) {
+        // Failures here can result from trying to query the workspace size for
+        // algorithms that aren't supported for the present configuration.  This
+        // means we'll now return only supported algorithms, unlike the
+        // predecessor 'GetConvolveAlgorithms', which returned all existing
+        // algorithms regardless of any particular configuration.
+        //
+        // TODO(awpr): can we arrange for the expected errors here to have a
+        // particular error code (e.g. UNIMPLEMENTED or INVALID_ARGUMENT) and
+        // log errors for anything unexpected?
+        continue;
+      }
+      out_exec_plans->push_back(runner_or.ConsumeValueOrDie());
     }
 
     return port::Status::OK();
@@ -5034,14 +5044,18 @@ port::Status CudnnSupport::GetFusedConvolveRunners(
           algo.algo_id() != CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM) {
         continue;
       }
-      SE_ASSIGN_OR_RETURN(
-          auto runner,
-          FusedConvolveRunnerFromDesc(algo, kind, input_type, bias_type,
-                                      output_type, conv_scale, side_input_scale,
-                                      input_descriptor, filter_descriptor,
-                                      bias_descriptor, output_descriptor,
-                                      convolution_descriptor, activation_mode));
-      out_exec_plans->push_back(std::move(runner));
+      auto runner_or = FusedConvolveRunnerFromDesc(
+          algo, kind, input_type, bias_type, output_type, conv_scale,
+          side_input_scale, input_descriptor, filter_descriptor,
+          bias_descriptor, output_descriptor, convolution_descriptor,
+          activation_mode);
+      if (!runner_or.ok()) {
+        // See the corresponding error handling in
+        // CudnnSupport::GetConvolveRunners: this filters out algorithms that
+        // don't support this conv.
+        continue;
+      }
+      out_exec_plans->push_back(runner_or.ConsumeValueOrDie());
     }
     return port::Status::OK();
   }

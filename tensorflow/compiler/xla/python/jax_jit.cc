@@ -566,7 +566,10 @@ xla::Status ComputeSignature(bool jax_enable_x64, xla::PyClient& pyclient,
   };
   static const auto& types = *[]() -> PythonTypes* {
     py::module xla_module(py::module::import("jax.interpreters.xla"));
-    py::object device_array(xla_module.attr("_DeviceArray"));
+    py::object device_array;
+    if (py::hasattr(xla_module, "_DeviceArray")) {
+      device_array = xla_module.attr("_DeviceArray");
+    }
     return new PythonTypes{device_array};
   }();
   // When the jitted function is not committed, we first check whether any
@@ -1089,14 +1092,13 @@ PyObject* JaxCompiledFunction_tp_call(PyObject* self, PyObject* args,
 
 PyObject* JaxCompiledFunction_tp_repr(PyObject* self) {
   try {
-    PyObject* wrapped =
-        PyObject_GetAttr(self, PyUnicode_FromString("__wrapped__"));
-    PyObject* repr =
-        PyObject_GetAttr(wrapped, PyUnicode_FromString("__repr__"));
-    return PyObject_CallObject(repr, nullptr);
-  } catch (py::error_already_set& e) {
+    const std::string& repr = absl::StrFormat(
+        "<CompiledFunction of %s>",
+        static_cast<std::string>(
+            py::repr(py::getattr(self, "__wrapped__"))));
+    return PyUnicode_FromString(repr.c_str());
+  } catch (...) {
     // Ignore all errors when accessing a repr.
-    e.restore();
     return PyUnicode_FromString("<CompiledFunction>");
   }
 }

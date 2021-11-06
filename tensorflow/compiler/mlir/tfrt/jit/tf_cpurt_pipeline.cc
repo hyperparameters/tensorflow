@@ -68,6 +68,7 @@ void CreateTfCpuRtPipeline(mlir::OpPassManager& pm,
   // Run shape inference to propagate potentially specialized input shapes.
   pm.addPass(std::make_unique<AddTensorflowProducerVersion>());
   pm.addPass(mlir::TF::CreateTFShapeInferencePass());
+  pm.addPass(mlir::createCanonicalizerPass());
 
   // Transform TF operation to HLO.
   pm.addNestedPass<mlir::FuncOp>(mlir::mhlo::createLegalizeTFPass());
@@ -105,10 +106,11 @@ void CreateTfCpuRtPipeline(mlir::OpPassManager& pm,
   pm.addNestedPass<mlir::FuncOp>(
       mlir::kernel_gen::transforms::CreateLowerIndexCastPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  pm.addNestedPass<mlir::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
+  pm.addNestedPass<mlir::FuncOp>(CreateFusionPass());
 
   // Perform tiling-padding-vectorization if vectorization is enabled.
   if (options.vectorize) {
+    pm.addNestedPass<mlir::FuncOp>(CreateDetensorizeLinalgPass());
     pm.addNestedPass<mlir::FuncOp>(CreateCodegenStrategyForReductionPass());
     pm.addNestedPass<mlir::FuncOp>(CreateCodegenStrategyForCWisePass());
     pm.addNestedPass<mlir::FuncOp>(CreatePeelTiledLoopsPass());
@@ -167,6 +169,8 @@ void CreateTfCpuRtPipeline(mlir::OpPassManager& pm,
   vec_to_scf_options.unroll = true;
   pm.addNestedPass<mlir::FuncOp>(
       mlir::createConvertVectorToSCFPass(vec_to_scf_options));
+
+  pm.addNestedPass<mlir::FuncOp>(CreateMathApproximationPass({"all"}));
 }
 
 void CreateDefaultTfCpuRtPipeline(mlir::OpPassManager& pm) {

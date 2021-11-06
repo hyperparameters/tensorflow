@@ -25,7 +25,7 @@ COMMON_PROTO_SRCS = [
     "bfc_memory_map.proto",
     "config.proto",
     "cluster.proto",
-    "coordination_service.proto",
+    "coordination_config.proto",
     "debug.proto",
     "device_filters.proto",
     "device_properties.proto",
@@ -162,6 +162,7 @@ exports_files(
         "tensorflow_server.proto",
         "trackable_object_graph.proto",
         "transport_options.proto",
+        "distributed_runtime_payloads.proto",
     ],
 )
 
@@ -193,6 +194,7 @@ tf_proto_library(
         "tensorflow_server.proto",
         "trackable_object_graph.proto",
         "transport_options.proto",
+        "distributed_runtime_payloads.proto",
     ],
     cc_api_version = 2,
     make_default_target_header_only = True,
